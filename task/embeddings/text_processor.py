@@ -2,14 +2,30 @@ from enum import StrEnum
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from pgvector.psycopg2 import register_vector
 
 from task.embeddings.embeddings_client import DialEmbeddingsClient
 from task.utils.text import chunk_text
 
 
+SQL_QUERY = """
+    SELECT text, 1 - (embedding {op} %(vector)s::vector) AS score
+    FROM vectors
+    WHERE 1 - (embedding {op} %(vector)s::vector) >= %(score_threshold)s
+    ORDER BY score
+    DESC LIMIT %(top_k)s
+"""
+
+
 class SearchMode(StrEnum):
     EUCLIDIAN_DISTANCE = "euclidean"  # Euclidean distance (<->)
     COSINE_DISTANCE = "cosine"  # Cosine distance (<=>)
+
+
+SEARCH_MODE_TO_OPERATOR = {
+    SearchMode.EUCLIDIAN_DISTANCE: '<->',
+    SearchMode.COSINE_DISTANCE: '<=>'
+}
 
 
 class TextProcessor:
@@ -39,8 +55,24 @@ class TextProcessor:
     #       hint 1: embeddings should be saved as string list
     #       hint 2: embeddings string list should be casted to vector ({embeddings}::vector)
 
+    def process_text_file(self, file_name: str, chunk_size: int, overlap: int, dimensions: int, truncate: bool):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
 
+            register_vector(conn)
 
+            if truncate:
+                cursor.execute('TRUNCATE vectors')
+
+            with open(file_name) as fp:
+                chunks = chunk_text(fp.read(), chunk_size, overlap)
+
+                embeddings_data = self.embeddings_client.get_embeddings(chunks, dimensions)
+
+                for idx, vector in embeddings_data.items():
+                    cursor.execute('INSERT INTO vectors (document_name, text, embedding) values (%s, %s, %s::vector)', (file_name, chunks[idx], vector))
+
+            conn.commit()
 
     #TODO:
     # provide method `search` that will:
@@ -53,3 +85,13 @@ class TextProcessor:
     #     hint 4: You need to filter distance in WHERE clause
     #     hint 5: To get top k use `limit`
 
+    def search(self, text: str, search_mode: SearchMode, top_k: int, score_threshold: float, dimensions: int) -> list[str]:
+        embeddings_data = self.embeddings_client.get_embeddings(text, dimensions)
+        vector = embeddings_data[0]
+
+        sql_query = SQL_QUERY.format(op=SEARCH_MODE_TO_OPERATOR[search_mode])
+
+        with self._get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql_query, {'vector': vector, 'score_threshold': score_threshold, 'top_k': top_k})
+                return [row[0] for row in cursor.fetchall()]
